@@ -1,7 +1,15 @@
-from typing import Any, Generic, Literal, TypeVar
+from collections.abc import Callable
+from typing import (
+    Annotated,
+    Any,
+    Generic,
+    Literal,
+    TypeAlias,
+    TypeVar,
+)
 
-from pydantic import BaseModel, ConfigDict, FileUrl, RootModel
-from pydantic.networks import AnyUrl
+from pydantic import BaseModel, ConfigDict, Field, FileUrl, RootModel
+from pydantic.networks import AnyUrl, UrlConstraints
 
 """
 Model Context Protocol bindings for Python
@@ -21,17 +29,20 @@ for reference.
   not separate types in the schema.
 """
 
-LATEST_PROTOCOL_VERSION = "2024-11-05"
+LATEST_PROTOCOL_VERSION = "2025-03-26"
 
 ProgressToken = str | int
 Cursor = str
+Role = Literal["user", "assistant"]
+RequestId = str | int
+AnyFunction: TypeAlias = Callable[..., Any]
 
 
 class RequestParams(BaseModel):
     class Meta(BaseModel):
         progressToken: ProgressToken | None = None
         """
-        If specified, the caller is requesting out-of-band progress notifications for
+        If specified, the caller requests out-of-band progress notifications for
         this request (as represented by notifications/progress). The value of this
         parameter is an opaque token that will be attached to any subsequent
         notifications. The receiver is not obligated to provide these notifications.
@@ -39,22 +50,24 @@ class RequestParams(BaseModel):
 
         model_config = ConfigDict(extra="allow")
 
-    _meta: Meta | None = None
+    meta: Meta | None = Field(alias="_meta", default=None)
 
 
 class NotificationParams(BaseModel):
     class Meta(BaseModel):
         model_config = ConfigDict(extra="allow")
 
-    _meta: Meta | None = None
+    meta: Meta | None = Field(alias="_meta", default=None)
     """
     This parameter name is reserved by MCP to allow clients and servers to attach
     additional metadata to their notifications.
     """
 
 
-RequestParamsT = TypeVar("RequestParamsT", bound=RequestParams)
-NotificationParamsT = TypeVar("NotificationParamsT", bound=NotificationParams)
+RequestParamsT = TypeVar("RequestParamsT", bound=RequestParams | dict[str, Any] | None)
+NotificationParamsT = TypeVar(
+    "NotificationParamsT", bound=NotificationParams | dict[str, Any] | None
+)
 MethodT = TypeVar("MethodT", bound=str)
 
 
@@ -78,6 +91,7 @@ class Notification(BaseModel, Generic[NotificationParamsT, MethodT]):
     """Base class for JSON-RPC notifications."""
 
     method: MethodT
+    params: NotificationParamsT
     model_config = ConfigDict(extra="allow")
 
 
@@ -86,7 +100,7 @@ class Result(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    _meta: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = Field(alias="_meta", default=None)
     """
     This result property is reserved by the protocol to allow clients and servers to
     attach additional metadata to their responses.
@@ -101,18 +115,16 @@ class PaginatedResult(Result):
     """
 
 
-RequestId = str | int
-
-
-class JSONRPCRequest(Request):
+class JSONRPCRequest(Request[dict[str, Any] | None, str]):
     """A request that expects a response."""
 
     jsonrpc: Literal["2.0"]
     id: RequestId
+    method: str
     params: dict[str, Any] | None = None
 
 
-class JSONRPCNotification(Notification):
+class JSONRPCNotification(Notification[dict[str, Any] | None, str]):
     """A notification which does not expect a response."""
 
     jsonrpc: Literal["2.0"]
@@ -268,7 +280,7 @@ class InitializeRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class InitializeRequest(Request):
+class InitializeRequest(Request[InitializeRequestParams, Literal["initialize"]]):
     """
     This request is sent from the client to the server when it first connects, asking it
     to begin initialization.
@@ -285,9 +297,13 @@ class InitializeResult(Result):
     """The version of the Model Context Protocol that the server wants to use."""
     capabilities: ServerCapabilities
     serverInfo: Implementation
+    instructions: str | None = None
+    """Instructions describing how to use the server and its features."""
 
 
-class InitializedNotification(Notification):
+class InitializedNotification(
+    Notification[NotificationParams | None, Literal["notifications/initialized"]]
+):
     """
     This notification is sent from the client to the server after initialization has
     finished.
@@ -297,7 +313,7 @@ class InitializedNotification(Notification):
     params: NotificationParams | None = None
 
 
-class PingRequest(Request):
+class PingRequest(Request[RequestParams | None, Literal["ping"]]):
     """
     A ping, issued by either the server or the client, to check that the other party is
     still alive.
@@ -321,11 +337,18 @@ class ProgressNotificationParams(NotificationParams):
     total is unknown.
     """
     total: float | None = None
+    """
+    Message related to progress. This should provide relevant human readable 
+    progress information.
+    """
+    message: str | None = None
     """Total number of items to process (or total progress required), if known."""
     model_config = ConfigDict(extra="allow")
 
 
-class ProgressNotification(Notification):
+class ProgressNotification(
+    Notification[ProgressNotificationParams, Literal["notifications/progress"]]
+):
     """
     An out-of-band notification used to inform the receiver of a progress update for a
     long-running request.
@@ -335,17 +358,25 @@ class ProgressNotification(Notification):
     params: ProgressNotificationParams
 
 
-class ListResourcesRequest(PaginatedRequest):
+class ListResourcesRequest(
+    PaginatedRequest[RequestParams | None, Literal["resources/list"]]
+):
     """Sent from the client to request a list of resources the server has."""
 
     method: Literal["resources/list"]
     params: RequestParams | None = None
 
 
+class Annotations(BaseModel):
+    audience: list[Role] | None = None
+    priority: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    model_config = ConfigDict(extra="allow")
+
+
 class Resource(BaseModel):
     """A known resource that the server is capable of reading."""
 
-    uri: AnyUrl
+    uri: Annotated[AnyUrl, UrlConstraints(host_required=False)]
     """The URI of this resource."""
     name: str
     """A human-readable name for this resource."""
@@ -353,6 +384,14 @@ class Resource(BaseModel):
     """A description of what this resource represents."""
     mimeType: str | None = None
     """The MIME type of this resource, if known."""
+    size: int | None = None
+    """
+    The size of the raw resource content, in bytes (i.e., before base64 encoding
+    or any tokenization), if known.
+
+    This can be used by Hosts to display file sizes and estimate context window usage.
+    """
+    annotations: Annotations | None = None
     model_config = ConfigDict(extra="allow")
 
 
@@ -373,6 +412,7 @@ class ResourceTemplate(BaseModel):
     The MIME type for all resources that match this template. This should only be
     included if all resources matching this template have the same type.
     """
+    annotations: Annotations | None = None
     model_config = ConfigDict(extra="allow")
 
 
@@ -382,7 +422,9 @@ class ListResourcesResult(PaginatedResult):
     resources: list[Resource]
 
 
-class ListResourceTemplatesRequest(PaginatedRequest):
+class ListResourceTemplatesRequest(
+    PaginatedRequest[RequestParams | None, Literal["resources/templates/list"]]
+):
     """Sent from the client to request a list of resource templates the server has."""
 
     method: Literal["resources/templates/list"]
@@ -398,7 +440,7 @@ class ListResourceTemplatesResult(PaginatedResult):
 class ReadResourceRequestParams(RequestParams):
     """Parameters for reading a resource."""
 
-    uri: AnyUrl
+    uri: Annotated[AnyUrl, UrlConstraints(host_required=False)]
     """
     The URI of the resource to read. The URI can use any protocol; it is up to the
     server how to interpret it.
@@ -406,7 +448,9 @@ class ReadResourceRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class ReadResourceRequest(Request):
+class ReadResourceRequest(
+    Request[ReadResourceRequestParams, Literal["resources/read"]]
+):
     """Sent from the client to the server, to read a specific resource URI."""
 
     method: Literal["resources/read"]
@@ -416,7 +460,7 @@ class ReadResourceRequest(Request):
 class ResourceContents(BaseModel):
     """The contents of a specific resource or sub-resource."""
 
-    uri: AnyUrl
+    uri: Annotated[AnyUrl, UrlConstraints(host_required=False)]
     """The URI of this resource."""
     mimeType: str | None = None
     """The MIME type of this resource, if known."""
@@ -446,7 +490,11 @@ class ReadResourceResult(Result):
     contents: list[TextResourceContents | BlobResourceContents]
 
 
-class ResourceListChangedNotification(Notification):
+class ResourceListChangedNotification(
+    Notification[
+        NotificationParams | None, Literal["notifications/resources/list_changed"]
+    ]
+):
     """
     An optional notification from the server to the client, informing it that the list
     of resources it can read from has changed.
@@ -459,7 +507,7 @@ class ResourceListChangedNotification(Notification):
 class SubscribeRequestParams(RequestParams):
     """Parameters for subscribing to a resource."""
 
-    uri: AnyUrl
+    uri: Annotated[AnyUrl, UrlConstraints(host_required=False)]
     """
     The URI of the resource to subscribe to. The URI can use any protocol; it is up to
     the server how to interpret it.
@@ -467,7 +515,7 @@ class SubscribeRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class SubscribeRequest(Request):
+class SubscribeRequest(Request[SubscribeRequestParams, Literal["resources/subscribe"]]):
     """
     Sent from the client to request resources/updated notifications from the server
     whenever a particular resource changes.
@@ -480,12 +528,14 @@ class SubscribeRequest(Request):
 class UnsubscribeRequestParams(RequestParams):
     """Parameters for unsubscribing from a resource."""
 
-    uri: AnyUrl
+    uri: Annotated[AnyUrl, UrlConstraints(host_required=False)]
     """The URI of the resource to unsubscribe from."""
     model_config = ConfigDict(extra="allow")
 
 
-class UnsubscribeRequest(Request):
+class UnsubscribeRequest(
+    Request[UnsubscribeRequestParams, Literal["resources/unsubscribe"]]
+):
     """
     Sent from the client to request cancellation of resources/updated notifications from
     the server.
@@ -498,7 +548,7 @@ class UnsubscribeRequest(Request):
 class ResourceUpdatedNotificationParams(NotificationParams):
     """Parameters for resource update notifications."""
 
-    uri: AnyUrl
+    uri: Annotated[AnyUrl, UrlConstraints(host_required=False)]
     """
     The URI of the resource that has been updated. This might be a sub-resource of the
     one that the client actually subscribed to.
@@ -506,7 +556,11 @@ class ResourceUpdatedNotificationParams(NotificationParams):
     model_config = ConfigDict(extra="allow")
 
 
-class ResourceUpdatedNotification(Notification):
+class ResourceUpdatedNotification(
+    Notification[
+        ResourceUpdatedNotificationParams, Literal["notifications/resources/updated"]
+    ]
+):
     """
     A notification from the server to the client, informing it that a resource has
     changed and may need to be read again.
@@ -516,7 +570,9 @@ class ResourceUpdatedNotification(Notification):
     params: ResourceUpdatedNotificationParams
 
 
-class ListPromptsRequest(PaginatedRequest):
+class ListPromptsRequest(
+    PaginatedRequest[RequestParams | None, Literal["prompts/list"]]
+):
     """Sent from the client to request a list of prompts and prompt templates."""
 
     method: Literal["prompts/list"]
@@ -563,7 +619,7 @@ class GetPromptRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class GetPromptRequest(Request):
+class GetPromptRequest(Request[GetPromptRequestParams, Literal["prompts/get"]]):
     """Used by the client to get a prompt provided by the server."""
 
     method: Literal["prompts/get"]
@@ -576,6 +632,7 @@ class TextContent(BaseModel):
     type: Literal["text"]
     text: str
     """The text content of the message."""
+    annotations: Annotations | None = None
     model_config = ConfigDict(extra="allow")
 
 
@@ -590,10 +647,8 @@ class ImageContent(BaseModel):
     The MIME type of the image. Different providers may support different
     image types.
     """
+    annotations: Annotations | None = None
     model_config = ConfigDict(extra="allow")
-
-
-Role = Literal["user", "assistant"]
 
 
 class SamplingMessage(BaseModel):
@@ -614,6 +669,7 @@ class EmbeddedResource(BaseModel):
 
     type: Literal["resource"]
     resource: TextResourceContents | BlobResourceContents
+    annotations: Annotations | None = None
     model_config = ConfigDict(extra="allow")
 
 
@@ -633,7 +689,11 @@ class GetPromptResult(Result):
     messages: list[PromptMessage]
 
 
-class PromptListChangedNotification(Notification):
+class PromptListChangedNotification(
+    Notification[
+        NotificationParams | None, Literal["notifications/prompts/list_changed"]
+    ]
+):
     """
     An optional notification from the server to the client, informing it that the list
     of prompts it offers has changed.
@@ -643,11 +703,59 @@ class PromptListChangedNotification(Notification):
     params: NotificationParams | None = None
 
 
-class ListToolsRequest(PaginatedRequest):
+class ListToolsRequest(PaginatedRequest[RequestParams | None, Literal["tools/list"]]):
     """Sent from the client to request a list of tools the server has."""
 
     method: Literal["tools/list"]
     params: RequestParams | None = None
+
+
+class ToolAnnotations(BaseModel):
+    """
+    Additional properties describing a Tool to clients.
+
+    NOTE: all properties in ToolAnnotations are **hints**.
+    They are not guaranteed to provide a faithful description of
+    tool behavior (including descriptive properties like `title`).
+
+    Clients should never make tool use decisions based on ToolAnnotations
+    received from untrusted servers.
+    """
+
+    title: str | None = None
+    """A human-readable title for the tool."""
+
+    readOnlyHint: bool | None = None
+    """
+    If true, the tool does not modify its environment.
+    Default: false
+    """
+
+    destructiveHint: bool | None = None
+    """
+    If true, the tool may perform destructive updates to its environment.
+    If false, the tool performs only additive updates.
+    (This property is meaningful only when `readOnlyHint == false`)
+    Default: true
+    """
+
+    idempotentHint: bool | None = None
+    """
+    If true, calling the tool repeatedly with the same arguments 
+    will have no additional effect on the its environment.
+    (This property is meaningful only when `readOnlyHint == false`)
+    Default: false
+    """
+
+    openWorldHint: bool | None = None
+    """
+    If true, this tool may interact with an "open world" of external
+    entities. If false, the tool's domain of interaction is closed.
+    For example, the world of a web search tool is open, whereas that
+    of a memory tool is not.
+    Default: true
+    """
+    model_config = ConfigDict(extra="allow")
 
 
 class Tool(BaseModel):
@@ -659,6 +767,8 @@ class Tool(BaseModel):
     """A human-readable description of the tool."""
     inputSchema: dict[str, Any]
     """A JSON Schema object defining the expected parameters for the tool."""
+    annotations: ToolAnnotations | None = None
+    """Optional additional tool information."""
     model_config = ConfigDict(extra="allow")
 
 
@@ -676,7 +786,7 @@ class CallToolRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class CallToolRequest(Request):
+class CallToolRequest(Request[CallToolRequestParams, Literal["tools/call"]]):
     """Used by the client to invoke a tool provided by the server."""
 
     method: Literal["tools/call"]
@@ -690,7 +800,9 @@ class CallToolResult(Result):
     isError: bool = False
 
 
-class ToolListChangedNotification(Notification):
+class ToolListChangedNotification(
+    Notification[NotificationParams | None, Literal["notifications/tools/list_changed"]]
+):
     """
     An optional notification from the server to the client, informing it that the list
     of tools it offers has changed.
@@ -713,7 +825,7 @@ class SetLevelRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class SetLevelRequest(Request):
+class SetLevelRequest(Request[SetLevelRequestParams, Literal["logging/setLevel"]]):
     """A request from the client to the server, to enable or adjust logging."""
 
     method: Literal["logging/setLevel"]
@@ -735,7 +847,9 @@ class LoggingMessageNotificationParams(NotificationParams):
     model_config = ConfigDict(extra="allow")
 
 
-class LoggingMessageNotification(Notification):
+class LoggingMessageNotification(
+    Notification[LoggingMessageNotificationParams, Literal["notifications/message"]]
+):
     """Notification of a log message passed from server to client."""
 
     method: Literal["notifications/message"]
@@ -756,7 +870,7 @@ class ModelHint(BaseModel):
 
 class ModelPreferences(BaseModel):
     """
-    The server's preferences for model selection, requested of the client during
+    The server's preferences for model selection, requested by the client during
     sampling.
 
     Because LLMs can vary along multiple dimensions, choosing the "best" model is
@@ -830,7 +944,9 @@ class CreateMessageRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class CreateMessageRequest(Request):
+class CreateMessageRequest(
+    Request[CreateMessageRequestParams, Literal["sampling/createMessage"]]
+):
     """A request from the server to sample an LLM via the client."""
 
     method: Literal["sampling/createMessage"]
@@ -887,7 +1003,7 @@ class CompleteRequestParams(RequestParams):
     model_config = ConfigDict(extra="allow")
 
 
-class CompleteRequest(Request):
+class CompleteRequest(Request[CompleteRequestParams, Literal["completion/complete"]]):
     """A request from the client to the server, to ask for completion options."""
 
     method: Literal["completion/complete"]
@@ -918,7 +1034,7 @@ class CompleteResult(Result):
     completion: Completion
 
 
-class ListRootsRequest(Request):
+class ListRootsRequest(Request[RequestParams | None, Literal["roots/list"]]):
     """
     Sent from the server to request a list of root URIs from the client. Roots allow
     servers to ask for specific directories or files to operate on. A common example
@@ -961,7 +1077,9 @@ class ListRootsResult(Result):
     roots: list[Root]
 
 
-class RootsListChangedNotification(Notification):
+class RootsListChangedNotification(
+    Notification[NotificationParams | None, Literal["notifications/roots/list_changed"]]
+):
     """
     A notification from the client to the server, informing it that the list of
     roots has changed.
@@ -973,6 +1091,28 @@ class RootsListChangedNotification(Notification):
 
     method: Literal["notifications/roots/list_changed"]
     params: NotificationParams | None = None
+
+
+class CancelledNotificationParams(NotificationParams):
+    """Parameters for cancellation notifications."""
+
+    requestId: RequestId
+    """The ID of the request to cancel."""
+    reason: str | None = None
+    """An optional string describing the reason for the cancellation."""
+    model_config = ConfigDict(extra="allow")
+
+
+class CancelledNotification(
+    Notification[CancelledNotificationParams, Literal["notifications/cancelled"]]
+):
+    """
+    This notification can be sent by either side to indicate that it is canceling a
+    previously-issued request.
+    """
+
+    method: Literal["notifications/cancelled"]
+    params: CancelledNotificationParams
 
 
 class ClientRequest(
@@ -997,7 +1137,10 @@ class ClientRequest(
 
 class ClientNotification(
     RootModel[
-        ProgressNotification | InitializedNotification | RootsListChangedNotification
+        CancelledNotification
+        | ProgressNotification
+        | InitializedNotification
+        | RootsListChangedNotification
     ]
 ):
     pass
@@ -1013,7 +1156,8 @@ class ServerRequest(RootModel[PingRequest | CreateMessageRequest | ListRootsRequ
 
 class ServerNotification(
     RootModel[
-        ProgressNotification
+        CancelledNotification
+        | ProgressNotification
         | LoggingMessageNotification
         | ResourceUpdatedNotification
         | ResourceListChangedNotification

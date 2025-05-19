@@ -2,7 +2,11 @@ name: Main branch checks
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "v*.*.*"
+    tags:
+      - "v*.*.*"
 
 jobs:
   checks:

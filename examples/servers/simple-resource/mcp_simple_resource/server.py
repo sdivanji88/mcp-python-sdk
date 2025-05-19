@@ -1,7 +1,8 @@
 import anyio
 import click
 import mcp.types as types
-from mcp.server import AnyUrl, Server
+from mcp.server.lowlevel import Server
+from pydantic import AnyUrl
 
 SAMPLE_RESOURCES = {
     "greeting": "Hello! This is a sample text resource.",
@@ -35,7 +36,8 @@ def main(port: int, transport: str) -> int:
 
     @app.read_resource()
     async def read_resource(uri: AnyUrl) -> str | bytes:
-        assert uri.path is not None
+        if uri.path is None:
+            raise ValueError(f"Invalid resource path: {uri}")
         name = uri.path.replace(".txt", "").lstrip("/")
 
         if name not in SAMPLE_RESOURCES:
@@ -46,9 +48,10 @@ def main(port: int, transport: str) -> int:
     if transport == "sse":
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
-        from starlette.routing import Route
+        from starlette.responses import Response
+        from starlette.routing import Mount, Route
 
-        sse = SseServerTransport("/messages")
+        sse = SseServerTransport("/messages/")
 
         async def handle_sse(request):
             async with sse.connect_sse(
@@ -57,15 +60,13 @@ def main(port: int, transport: str) -> int:
                 await app.run(
                     streams[0], streams[1], app.create_initialization_options()
                 )
-
-        async def handle_messages(request):
-            await sse.handle_post_message(request.scope, request.receive, request._send)
+            return Response()
 
         starlette_app = Starlette(
             debug=True,
             routes=[
-                Route("/sse", endpoint=handle_sse),
-                Route("/messages", endpoint=handle_messages, methods=["POST"]),
+                Route("/sse", endpoint=handle_sse, methods=["GET"]),
+                Mount("/messages/", app=sse.handle_post_message),
             ],
         )
 
